@@ -25,8 +25,6 @@ from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, Llama
 
 from transformers.cache_utils import DynamicCache
 
-import flashinfer
-
 class PredictorDynamicCache(DynamicCache):
     def __init__(self):
         super().__init__()
@@ -475,6 +473,245 @@ class TokenImportancePredictorAttentive(nn.Module):
         return q_importance, k_importance
 
 
+
+class HeadImportancePredictor(nn.Module):
+    def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
+                 attn_reduce_factor, dropout=0.1):
+        """
+        Optimized Token Importance Predictor with parallel Q-K projections and simplified mapping.
+        
+        Args:
+            config: Configuration object containing model parameters.
+            pred_hid_size (int): Hidden size for the predictor's attention layer.
+            num_heads (int): Number of attention heads.
+            num_hidden_layers (int): Number of transformer layers to predict.
+            dropout (float): Dropout probability.
+            q_downscale (int): Factor to downscale the Q dimension for efficiency.
+            intermediate_dim (int): Intermediate dimension for non-linear transformations in projections.
+        """
+        super().__init__()
+        self.is_head_predictor = None
+        self.config = config
+        self.hidden_size = pred_hid_size
+        self.num_heads = num_heads
+        self.num_hidden_layers = num_hidden_layers
+        self.dropout = dropout
+        self.head_dim = pred_hid_size // (num_heads * 4)
+        self.rope_theta = config.rope_theta
+        self.dDash = dDash
+        self.intermediate_dim = intdim
+        self.attn_reduce_factor = attn_reduce_factor
+        self.max_position_embeddings = config.max_position_embeddings
+        self.flash_attn = False
+
+        # Reduce the hidden size for attention computations
+        self.hidden_size_reduced = self.hidden_size // self.attn_reduce_factor  # For example, reduce to 1/4th
+        assert self.hidden_size_reduced % self.num_heads == 0, "Reduced hidden size must be divisible by num_heads"
+        self.attn_head_dim = self.hidden_size_reduced // self.num_heads
+
+        # Input projection to reduce hidden size
+        self.input_proj = nn.Linear(self.hidden_size, self.hidden_size_reduced, bias=False)
+
+        # Query, Key, Value projections for attention
+        self.q_proj_attn = nn.Linear(self.hidden_size_reduced, self.hidden_size_reduced, bias=False)
+        self.k_proj_attn = nn.Linear(self.hidden_size_reduced, self.hidden_size_reduced, bias=False)
+        self.v_proj_attn = nn.Linear(self.hidden_size_reduced, self.hidden_size_reduced, bias=False)
+        # Output projection to restore hidden size
+        # self.o_proj_attn = nn.Linear(self.hidden_size_reduced, self.hidden_size_reduced, bias=False)
+        self.attn_dropout = nn.Dropout(self.dropout)
+
+        # LayerNorm and Feed-forward network
+        self.norm1 = nn.LayerNorm(self.hidden_size_reduced)
+        self.norm2 = nn.LayerNorm(self.hidden_size)
+
+        self.ffn_hidden_size = 4 * self.hidden_size_reduced  # Typical FFN hidden size
+        self.ffn = nn.Sequential(
+            nn.Linear(self.hidden_size_reduced, self.ffn_hidden_size),
+            nn.GELU(),
+            nn.Linear(self.ffn_hidden_size, self.num_heads * self.num_hidden_layers),
+        )
+
+        # Initialize rotary positional embeddings
+        self._init_rope()
+        self._initialize_weights()
+        self.device = None
+
+    def _initialize_weights(self):
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)  # Xavier initialization for linear layers
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.weight, 1.0)
+                nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.MultiheadAttention):
+                # Initialize in_proj_weight
+                nn.init.xavier_uniform_(module.in_proj_weight)
+                if module.in_proj_bias is not None:
+                    nn.init.constant_(module.in_proj_bias, 0)
+
+                # Initialize out_proj
+                nn.init.xavier_uniform_(module.out_proj.weight)
+                if module.out_proj.bias is not None:
+                    nn.init.constant_(module.out_proj.bias, 0)
+
+    def _init_rope(self):
+        config_copy = copy.deepcopy(self.config)
+        config_copy.head_dim = self.attn_head_dim
+        # Rotary embedding for attention layer
+        self.rotary_emb_attn = LlamaRotaryEmbedding(
+            config_copy
+        )
+        # Rotary embedding for importance projection
+        self.rotary_emb_importance = LlamaRotaryEmbedding(
+            config_copy
+        )
+
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, use_cache=False):
+        """
+        Forward pass for the Optimized Token Importance Predictor.
+        
+        Args:
+            hidden_states (torch.Tensor): Input tensor of shape [B, L, HQ].
+            attention_mask (torch.Tensor, optional): Attention mask of shape [B, 1, 1, L] or [B, 1, L, L].
+            position_ids (torch.Tensor, optional): Position IDs.
+            past_key_value (tuple, optional): Past key and value states.
+            use_cache (bool, optional): Whether to use cache.
+        
+        Returns:
+            torch.Tensor: Importance scores of shape [B, N, H, L, L].
+        """
+        # Set device if not already set
+        if self.device != hidden_states.device:
+            self.device = hidden_states.device
+            self.to(self.device)
+
+        B, L, E = hidden_states.size()
+        if past_key_value is None:
+            past_key_value = {}
+        # if L == 1:
+        #     import pdb; pdb.set_trace()
+        past_primary = past_key_value.get('primary', None)
+        # Reduce hidden size
+        hidden_states = hidden_states.to(self.input_proj.weight.dtype)
+        hidden_states_reduced = self.input_proj(hidden_states)  # [B, L, hidden_size_reduced]
+        # Compute q, k, v for attention
+        q = self.q_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]
+        k = self.k_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]
+        v = self.v_proj_attn(hidden_states_reduced)  # [B, L, hidden_size_reduced]
+        # Reshape q, k, v to [B, num_heads, L, attn_head_dim]
+        q = q.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
+        k = k.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
+        v = v.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)  # [B, num_heads, L, attn_head_dim]
+        # Compute kv_seq_len before concatenation
+        if past_primary is not None:
+            past_L = past_primary[0].shape[2]
+            kv_seq_len = past_L + L
+        else:
+            kv_seq_len = L
+        
+        # Apply rotary positional embeddings based on kv_seq_len
+        cos, sin = self.rotary_emb_attn(v, position_ids)
+        if position_ids is None:
+            position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=self.device)
+            position_ids = position_ids.unsqueeze(0).expand(B, kv_seq_len)
+        
+        if past_primary is not None:
+            # Concatenate past k and v
+            k = torch.cat([past_primary[0], k], dim=2)  # [B, num_heads, past_L + L, attn_head_dim]
+            v = torch.cat([past_primary[1], v], dim=2)  # [B, num_heads, past_L + L, attn_head_dim]
+        
+        # Apply rotary embeddings after concatenation
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        
+        # Update cache if use_cache is True
+        if use_cache:
+            past_key_value['primary'] = (k.detach(), v.detach())
+
+        # if self.flash_attn:
+        #     sm_scale = 1.0 / math.sqrt(self.attn_head_dim)
+        #     attn_output = attention(q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16), True, sm_scale).to(q.dtype)
+        # else:
+        #     attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        attn_output = attn_output.to(q.dtype)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced)
+        attn_output = self.norm1(attn_output)
+        head_importances = self.ffn(attn_output)
+        return head_importances, past_key_value
+
+def calculate_hit_metrics(estimated_importance: torch.Tensor, 
+                          true_importance: torch.Tensor, 
+                          top_k_ratio: float = 0.5) -> Tuple[float, float, float]:
+    """
+    Calculate hit accuracy, mean, and max rank correlation between estimated and true importance tensors.
+    We compute metrics along the last dimension of the input tensors.
+
+    Shapes:
+      - 4D token-importance: [B, H, L, L]. We slice the last query (index -1) => [B, H, L].
+      - 3D head-importance:  [B, L, H]. We use all of it as-is => [B, L, H].
+    
+    Args:
+        estimated_importance (torch.Tensor): [B, H, L, L] or [B, L, H]
+        true_importance      (torch.Tensor): [B, H, L, L] or [B, L, H]
+        top_k_ratio (float): Fraction of top-k elements to consider for hit accuracy (default=0.5).
+    
+    Returns:
+        (hit_accuracy, mean_corr, max_corr):
+            hit_accuracy (float): Intersection ratio of top-k sets (0..1).
+            mean_corr (float): Average Spearman rank correlation over all [B, ...].
+            max_corr (float): Maximum Spearman rank correlation among all [B, ...].
+    """
+
+    # 1) Standardize shapes so the last dimension is what we rank over.
+    if estimated_importance.dim() == 4:
+        # Shape is [B, H, L, L] => slice to keep only the last query => [B, H, L]
+        estimated_importance = estimated_importance[:, :, -1, :]
+        true_importance      = true_importance[:, :, -1, :]
+        # after slicing: [B, H, L]
+        # For intersection denominator => top_k * B * H
+        denom_for_hits = estimated_importance.size(0) * estimated_importance.size(1)
+    elif estimated_importance.dim() == 3:
+        # Shape is [B, L, H], the last dimension is H
+        # For intersection denominator => top_k * B * L
+        denom_for_hits = estimated_importance.size(0) * estimated_importance.size(1)
+    else:
+        raise ValueError("Tensors must be either 4D [B,H,L,L] or 3D [B,L,H].")
+
+    # 2) Compute Spearman rank correlation along the last dimension.
+    #    Sort indices in descending order => get 'ranks' for correlation.
+    _, sorted_esti = torch.sort(estimated_importance, dim=-1, descending=True)
+    _, sorted_true = torch.sort(true_importance, dim=-1, descending=True)
+
+    # Spearman's rho = 1 - 6 * sum(d^2) / [n*(n^2 - 1)]
+    n = sorted_esti.shape[-1]
+    d = sorted_esti.float() - sorted_true.float()
+    d_squared = d ** 2
+    sum_d_squared = d_squared.sum(dim=-1)
+    rank_corr = 1 - (6 * sum_d_squared) / (n * (n**2 - 1))  # shape: [B,H] or [B,L]
+
+    mean_corr = rank_corr.mean().item()
+    max_corr  = rank_corr.max().item()
+
+    # 3) Compute top-k hit accuracy along the last dimension.
+    top_k = max(1, int(n * top_k_ratio))
+    _, top_esti_indices = torch.topk(estimated_importance, top_k, dim=-1)
+    _, top_true_indices = torch.topk(true_importance,      top_k, dim=-1)
+
+    # top_esti_indices => [B,H,top_k] or [B,L,top_k]
+    # top_true_indices => [B,H,top_k] or [B,L,top_k]
+    # matches => [B,H,top_k,top_k] or [B,L,top_k,top_k]
+    matches = (top_esti_indices.unsqueeze(-1) == top_true_indices.unsqueeze(-2))
+    intersection = matches.any(dim=-1).sum(dim=-1)  # => [B,H] or [B,L]
+
+    # Each [B,H] or [B,L] element can have at most 'top_k' matches, so total is top_k * denom_for_hits.
+    total_possible = top_k * denom_for_hits
+    hit_accuracy = intersection.sum().item() / total_possible  # => 0..1
+
+    return hit_accuracy, mean_corr, max_corr
+
+
 def threshold_to_mask(unadj_importance_mask, perhead_thresholds, min_sparse_index, bsz, q_len, key_len):
     """
     Create a mask tensor based on per-head thresholds, setting values below the threshold to -inf.
@@ -613,251 +850,6 @@ def sorted_index_to_mask(
 
     return mask_tensor
 
-class FlashInferDynamicCache(PredictorDynamicCache):
-    """
-    Extended DynamicCache that uses FlashInfer's paged KV cache for faster decoding.
-    Designed for batch_size=1 and page_size=1 (one token per page).
-    Maintains compatibility with predictor caches.
-    """
-    def __init__(self):
-        super().__init__()
-        self.initialized = False
-        self.decode_wrapper = None
-        self.max_seq_len = 8192  # Initial allocation
-        self.workspace_buffer = None
-        self.indptr_buffer = None
-        self.indices_buffer = None 
-        self.last_page_len_buffer = None
-        self.output = False
-        self.kv_cache_layers = []
-        self.current_len = 0
-        # Track whether to use FlashInfer for specific layers
-        self.flashinfer_enabled_layers = set()
-
-    def initialize(self, config, dtype=None, device="cuda:0"):
-        """Initialize the flashinfer resources"""
-        if self.initialized:
-            return
-            
-        self.num_layers = config.num_hidden_layers
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        
-        # Ensure we're using a supported dtype (float16 or bfloat16)
-        if dtype is None or dtype == torch.float32:
-            self.dtype = torch.float16  # Default to float16 if not specified or if float32
-        else:
-            self.dtype = dtype
-            
-        self.device = device
-        self.page_size = 1  # One token per page
-        
-        # Allocate workspace buffer (128MB)
-        self.workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-        
-        # Allocate buffers for page table (oversized for growth)
-        self.indptr_buffer = torch.zeros(2, dtype=torch.int32, device=device)  # [batch_size + 1]
-        self.indices_buffer = torch.arange(self.max_seq_len, dtype=torch.int32, device=device)
-        self.last_page_len_buffer = torch.ones(1, dtype=torch.int32, device=device)  # [batch_size]
-        
-        # Initialize flashinfer wrapper
-        self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            self.workspace_buffer, "HND"
-        )
-        
-        # Create paged KV cache for each layer
-        self.kv_cache_layers = [
-            torch.zeros(
-                self.max_seq_len, 2, self.num_kv_heads, self.page_size, self.head_dim,
-                dtype=self.dtype, device=device
-            ) for _ in range(self.num_layers)
-        ]
-        
-        self.initialized = True
-
-    def plan(self):
-        """Plan the decode operation with current sequence length"""
-        if self.current_len == 0:
-            return
-            
-        # Update indptr according to current sequence length
-        self.indptr_buffer[0] = 0
-        self.indptr_buffer[1] = self.current_len
-        
-        # Ensure indices are correct (may be unnecessary if using arange)
-        if len(self.indices_buffer) < self.current_len:
-            self.indices_buffer = torch.arange(self.max_seq_len, dtype=torch.int32, device=self.device)
-            
-        try:
-            token_sparsity = 1.0
-            indices_buffer = self.indices_buffer[:int(self.current_len * token_sparsity)]
-            # print(f'intptr_buffer: {self.indptr_buffer}')
-            # print(f'indices_buffer: {indices_buffer}')
-            # print(f'last_page_len_buffer: {self.last_page_len_buffer}')
-            # Plan decode with current sequence configuration
-            self.decode_wrapper.end_forward()
-            self.decode_wrapper.plan(
-                self.indptr_buffer,
-                indices_buffer,
-                self.last_page_len_buffer,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.page_size,
-                pos_encoding_mode="ROPE_LLAMA",
-                q_data_type=self.dtype,
-                kv_data_type=self.dtype
-            )
-        except Exception as e:
-            print(f"Warning: FlashInfer plan failed with error: {e}")
-            print(f"Disabling FlashInfer for this batch. Will use standard attention instead.")
-            # If planning fails, disable flashinfer for all layers
-            self.flashinfer_enabled_layers = set()
-
-    def resize_if_needed(self, target_len):
-        """Resize buffers if needed to accommodate longer sequences"""
-        if target_len <= self.max_seq_len:
-            return
-            
-        new_max_len = max(self.max_seq_len * 2, target_len)
-        
-        # Resize indices buffer
-        self.indices_buffer = torch.arange(new_max_len, dtype=torch.int32, device=self.device)
-        
-        # Resize KV cache for each layer
-        new_kv_cache_layers = []
-        for layer_idx, old_cache in enumerate(self.kv_cache_layers):
-            # Create new cache with larger size
-            new_cache = torch.zeros(
-                new_max_len, 2, self.num_kv_heads, self.page_size, self.head_dim,
-                dtype=self.dtype, device=self.device
-            )
-            # Copy old data
-            new_cache[:self.current_len] = old_cache[:self.current_len]
-            new_kv_cache_layers.append(new_cache)
-            
-        self.kv_cache_layers = new_kv_cache_layers
-        self.max_seq_len = new_max_len
-
-    def update(self, key_states, value_states, layer_idx):
-        """
-        Update KV cache with new key and value states
-        Returns the concatenated KV states
-        """
-        # input key_states: [1, num_heads, seq_len, head_dim]
-        # input value_states: [1, num_heads, seq_len, head_dim]
-        # First, use the parent class's standard update logic to maintain HF compatibility
-        # and update the basic DynamicCache fields
-        if layer_idx >= len(self.key_cache):
-            # Extend lists if necessary
-            self._ensure_list_capacity(self.key_cache, layer_idx, None)
-            self._ensure_list_capacity(self.value_cache, layer_idx, None)
-            
-        if self.key_cache[layer_idx] is None:
-            self.key_cache[layer_idx] = key_states
-            self.value_cache[layer_idx] = value_states
-        else:
-            # Concatenate along the sequence length dimension
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=2)
-        
-        # Now handle FlashInfer-specific updates
-        # Ensure cache is initialized
-        if not self.initialized:
-            config = getattr(self, "config", None)
-            if config is None:
-                # Extract config from key_states
-                batch_size, num_heads, seq_len, head_dim = key_states.shape
-                config = type('Config', (), {
-                    'num_hidden_layers': len(self.key_cache) if self.key_cache else 32, # default, will be updated later
-                    'num_attention_heads': num_heads,
-                    'num_key_value_heads': num_heads,  # Assume same as num_heads if not specified
-                    'hidden_size': num_heads * head_dim
-                })
-            # Initialize with the tensor's dtype, but convert float32 to float16 automatically
-            dtype = key_states.dtype if key_states.dtype != torch.float32 else torch.float16
-            self.initialize(config, dtype=dtype, device=key_states.device)
-
-        # Add this layer to the set of FlashInfer-enabled layers
-        self.flashinfer_enabled_layers.add(layer_idx)
-        
-        # Extract shapes
-        batch_size, num_heads, seq_len, head_dim = key_states.shape
-        
-        # Prepare for new tokens
-        new_len = self.current_len + seq_len
-        self.resize_if_needed(new_len)
-        
-        # Cast inputs to the correct dtype if needed
-        if key_states.dtype != self.dtype:
-            key_states = key_states.to(self.dtype)
-        if value_states.dtype != self.dtype:
-            value_states = value_states.to(self.dtype)
-        # Update KV cache for the specific layer
-        layer_cache = self.kv_cache_layers[layer_idx]
-        # key_states: [1, num_kv_heads, seq_len, head_dim] -> key_reshaped: [seq_len, 2, num_kv_heads, page_size, head_dim]
-        # value_states: [1, num_kv_heads, seq_len, head_dim] -> value_reshaped: [seq_len, 2, num_kv_heads, page_size, head_dim]
-        key_reshaped = key_states.squeeze(0).permute(1, 0, 2).unsqueeze(2)
-        value_reshaped = value_states.squeeze(0).permute(1, 0, 2).unsqueeze(2)
-        #layer_cache: [max_seq_len, 2, page_size, num_kv_heads, head_dim]
-        # # Update current length for next call
-        if layer_idx == 0:  # Only increment once per layer stack
-            self.current_len = new_len
-            # Update planning for flashinfer
-            self.plan()
-        if seq_len == 1:
-            layer_cache[self.current_len - 1, 0] = key_reshaped[0]
-            layer_cache[self.current_len - 1, 1] = value_reshaped[0]
-        else:
-            start_idx = self.current_len - seq_len
-            layer_cache[start_idx:self.current_len, 0] = key_reshaped
-            layer_cache[start_idx:self.current_len, 1] = value_reshaped
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
-    
-    def get_layer_cache(self, layer_idx):
-        """Get the flashinfer compatible cache for a specific layer"""
-        if not self.initialized or layer_idx >= len(self.kv_cache_layers):
-            return None
-        return self.kv_cache_layers[layer_idx]
-        
-    def run_flashinfer_decode(self, q, layer_idx):
-        """
-        Run flashinfer decode for a specific layer
-        q: query tensor [1, num_heads, seq_len, head_dim]
-        """
-        if not self.initialized or self.current_len == 0 or layer_idx not in self.flashinfer_enabled_layers:
-            return None
-            
-        # Ensure query is in the correct data type
-        if q.dtype != self.dtype:
-            q = q.to(self.dtype)
-        # Get layer's KV cache
-        layer_cache = self.kv_cache_layers[layer_idx]
-        try:
-            
-            # Run flashinfer decode
-            return self.decode_wrapper.run(
-                q.squeeze(-2), 
-                layer_cache[:self.current_len]  # Only use valid entries
-            )
-        except Exception as e:
-            print(f"Warning: FlashInfer decode failed with error: {e}")
-            print(f"Disabling FlashInfer for layer {layer_idx}. Will use standard attention instead.")
-            # If decode fails, disable flashinfer for this layer
-            if layer_idx in self.flashinfer_enabled_layers:
-                self.flashinfer_enabled_layers.remove(layer_idx)
-            return None
-        
-    def crop(self, max_length: int):
-        """Crop cache to max_length"""
-        super().crop(max_length)
-        
-        if self.initialized:
-            self.current_len = min(self.current_len, max_length)
-            # No need to physically crop the tensors, just update the length
-
-
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """LlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
@@ -926,7 +918,7 @@ class LlamaAttentionExperimental(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
-        self.inference_mode = True
+        self.inference_mode = False
         self.producer = producer
         self.layer_idx = layer_idx
         self.token_sparse_method = None
@@ -973,6 +965,12 @@ class LlamaAttentionExperimental(nn.Module):
             intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor
         ).to('cuda:0')
         self.sparse_token_predictor.flash_attn = self.flash_attn
+        if self.train_headpredictor:
+            self.sparse_head_predictor = HeadImportancePredictor(
+                self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
+                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor
+            ).to('cuda:0')
+            self.sparse_head_predictor.flash_attn = self.flash_attn
 
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
@@ -1084,115 +1082,199 @@ class LlamaAttentionExperimental(nn.Module):
         
         if use_cache:
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-        # if self.layer_idx == 0 and q_len != 1:
-        #     print(f'key_states: {key_states}')
-        # if self.inference_mode and q_len == 1 and self.layer_idx in past_key_value.flashinfer_enabled_layers:
-        if self.inference_mode and q_len == 1:
-            attn_output = past_key_value.run_flashinfer_decode(query_states, self.layer_idx)
-            #[batch_size, num_qo_heads, head_dim] -> [batch_size, q_len, num_qo_heads * head_dim]
-            attn_output = attn_output.view(bsz, q_len, self.num_heads * self.head_dim).to(self.o_proj.weight.dtype)
-            attn_output = self.o_proj(attn_output)
-            attn_weights = None
-            # key_states = repeat_kv(key_states, self.num_key_value_groups)
-            # value_states = repeat_kv(value_states, self.num_key_value_groups)
-            # attn_output = F.scaled_dot_product_attention(
-            #     query_states,                
-            #     key_states,                  
-            #     value_states,                
-            #     attn_mask=None,                          
-            #     is_causal=False          
-            # )
-            # attn_output = attn_output.transpose(1, 2).contiguous()
-            # attn_output = attn_output.view(bsz, -1, self.hidden_size)
-            # attn_output = self.o_proj(attn_output)
-            # attn_weights = None
-        else:
-            kv_seq_len = key_states.shape[-2]
-            final_mask = None
 
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
+        kv_seq_len = key_states.shape[-2]
+        final_mask = None
 
-            key_len = key_states.size(2)
-            bsz, q_len = query_states.size(0), query_states.size(2)
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-            if attention_mask is None:
-                # We want a [q_len, kv_seq_len] boolean upper-triangular mask
-                causal_mask_2d = torch.ones(q_len, kv_seq_len, 
-                                            device=hidden_states.device, 
-                                            dtype=torch.bool).triu(diagonal=1)
-                # Then shape it to [bsz, 1, q_len, kv_seq_len]
-                causal_mask_4d = causal_mask_2d.unsqueeze(0).expand(bsz, 1, q_len, kv_seq_len)
-                # Now fill -inf where the mask is True
-                attention_mask = torch.full_like(causal_mask_4d, 0, dtype=hidden_states.dtype)
-                if q_len != 1:
-                    attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
+        key_len = key_states.size(2)
+        bsz, q_len = query_states.size(0), query_states.size(2)
 
-            if self.inference_mode:
-                min_sparse_index = self.min_sparse_index
-                with torch.no_grad():
-                    if evalmode == "ExpPred":
-                        if self.layer_idx > 0:
-                            q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
-                            k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
-                            importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
-                            importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
-                            attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if attention_mask is None:
+            # We want a [q_len, kv_seq_len] boolean upper-triangular mask
+            causal_mask_2d = torch.ones(q_len, kv_seq_len, 
+                                        device=hidden_states.device, 
+                                        dtype=torch.bool).triu(diagonal=1)
+            # Then shape it to [bsz, 1, q_len, kv_seq_len]
+            causal_mask_4d = causal_mask_2d.unsqueeze(0).expand(bsz, 1, q_len, kv_seq_len)
+            # Now fill -inf where the mask is True
+            attention_mask = torch.full_like(causal_mask_4d, 0, dtype=hidden_states.dtype)
+            if q_len != 1:
+                attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
+
+        if self.inference_mode:
+            min_sparse_index = self.min_sparse_index
+            with torch.no_grad():
+                if evalmode == "ExpPred":
+                    if self.layer_idx > 0:
+                        q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
+                        k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
+                        importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
+                        importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
+                        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                        if self.calc_hitrates:
+                            self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
+                                estimated_importance=importance_mask,
+                                true_importance=attn_weights,
+                                top_k_ratio=0.5
+                            )
+                        if self.calibrate_thresholds:
+                            ### Threshold variance investigation
+                            unadj_importance_mask = importance_mask.clone()
+                            importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
+                            sorted_indices = torch.argsort(importance_mask, dim=-1, descending=True)
+                            sorted_indices = sorted_indices[:, :, -q_len:, :]
+                            sorted_values, sorted_ix = torch.sort(importance_mask, dim=-1)
+                            sorted_true_values, _ = torch.sort(torch.gather(unadj_importance_mask, dim=-1, index=sorted_ix), dim=-1)
+                            true_thresholds = sorted_true_values[:, :, :, int(importance_mask.size(-1) * self.sparse_aggression)]
+                            thresholds = sorted_values[:, :, :, int(importance_mask.size(-1) * self.sparse_aggression)]
+                            self.true_threshmean = true_thresholds
+                            self.threshmean = thresholds
+                        if self.test_with_thresholds:
+                            unadj_importance_mask = importance_mask.clone()
+                            perhead_thresholds = self.tok_calibration_set[self.layer_idx - 1].to(unadj_importance_mask.device) # 0 does not have calibration data.
+                            mask_tensor = threshold_to_mask(unadj_importance_mask, perhead_thresholds, min_sparse_index, bsz, q_len, key_len)
+                        else:
                             importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
                             sorted_indices = torch.argsort(importance_mask, dim=-1, descending=True)
                             sorted_indices = sorted_indices[:, :, -q_len:, :]
                             mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
-                            ### Threshold variance investigation
-                            if self.sliding_window is not None:
-                                if not hasattr(self, "window_cache"):
-                                    self.window_cache = SlidingWindowCache(max_seq_len=1024,
-                                                                        sliding_window=self.sliding_window,
-                                                                        device=mask_tensor.device)
-                                window = self.window_cache.get_window(q_len, key_len)
-                                mask_tensor = enforce_sliding_window(mask_tensor, window)
-                            final_mask = mask_tensor
+                        ### Threshold variance investigation
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(max_seq_len=1024,
+                                                                    sliding_window=self.sliding_window,
+                                                                    device=mask_tensor.device)
+                            window = self.window_cache.get_window(q_len, key_len)
+                            mask_tensor = enforce_sliding_window(mask_tensor, window)
+                        final_mask = mask_tensor
 
-                            self.final_mask_investigate = final_mask
-                            attn_weights = attn_weights + mask_tensor + attention_mask
-                        else:
-                            attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-                            attn_weights = attn_weights + attention_mask
+                        self.final_mask_investigate = final_mask
+                        attn_weights = attn_weights + mask_tensor + attention_mask
                     else:
-                        raise ValueError(f"Unknown eval mode {evalmode}")
-                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
-                attn_output = torch.matmul(attn_weights, value_states)
-
-                attn_output = attn_output.transpose(1, 2).contiguous()
-                attn_output = attn_output.view(bsz, -1, self.hidden_size)
-
-                if self.config.pretraining_tp > 1:
-                    attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-                    o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-                    attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+                        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                        attn_weights = attn_weights + attention_mask
                 else:
-                    attn_output = self.o_proj(attn_output)
-            if self.producer is None:
-                try:
-                    q_importance, k_importance = self.sparse_token_predictor(
+                    raise ValueError(f"Unknown eval mode {evalmode}")
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_states)
+
+        else:
+            attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)   
+            if self.layer_idx > 0:
+                q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
+                k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
+                importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
+                importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
+
+                if self.lookahead == 0:
+                    self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
+                else:
+                    self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
+                self.msemagn_loss = (self.msemagn_loss).mean(dim=(-1, -2))
+                self.msemagn_loss = self.msemagn_loss.mean()
+
+                if self.calc_hitrates:
+                    self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
+                        estimated_importance=importance_mask,
+                        true_importance=attn_weights,
+                        top_k_ratio=0.5
+                    )
+
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_states)
+
+        if self.layer_idx > 0 and self.train_headpredictor:
+            head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency].float().to(attn_output.device)
+            attn_head_weights = attn_output.mean(dim=-1).permute(0, 2, 1)
+            self.headmsemagn_loss = self.headmseloss(attn_head_weights, head_importance_tensor).mean()
+
+            if self.calc_hitrates:
+                self.head_hit_acc, self.head_mean_rank_corr, self.head_max_rank_corr = calculate_hit_metrics(
+                    estimated_importance=head_importance_tensor,
+                    true_importance=attn_head_weights,
+                    top_k_ratio=0.5
+                )
+        else:
+            self.headmsemagn_loss = 0
+            if self.calc_hitrates:
+                self.head_hit_acc, self.head_mean_rank_corr, self.head_max_rank_corr = 0, 0, 0
+
+            
+        checkeverytime = hasattr(self, 'test_with_thresholds')
+        if checkeverytime:
+            checkeverytime = self.test_with_thresholds
+        if final_mask is not None:
+            if self.effective_sparsity is None or checkeverytime:
+                true_mask = final_mask + attention_mask
+                num_deact = true_mask.bool().sum(dim=-1)                   # Number of tokens disabled.
+                causally_deact = (attention_mask.bool()).sum(dim=-1).expand_as(num_deact)        # Number of tokens disabled causally anyway
+                additional_deact = (num_deact - causally_deact)
+                num_active = (~attention_mask.bool()).sum(dim=-1).expand_as(num_deact)    # Number of tokens active at this position if zero-sparsity
+                effective_sparsity = 100 * (additional_deact.float() / num_active.float()).mean().item()
+                self.effective_sparsity = effective_sparsity
+                print("Effective Sparsity:", effective_sparsity, "%\t Sequence Length:", q_len)
+        if self.layer_idx == 0:
+            if self.effective_sparsity is None:
+                self.effective_sparsity = 0.0
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, -1, self.hidden_size)
+
+        if self.config.pretraining_tp > 1:
+            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
+            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+        else:
+            attn_output = self.o_proj(attn_output)
+
+        if self.producer is None:
+            try:
+                q_importance, k_importance = self.sparse_token_predictor(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,  # the same single cache
+                    use_cache=use_cache,
+                    layer_idx=self.layer_idx,       # or pass 0
+                )
+                if self.train_headpredictor:
+                    head_importances, past_key_value_hp = self.sparse_head_predictor(
                         hidden_states,
                         attention_mask=attention_mask,
                         position_ids=position_ids,
-                        past_key_value=past_key_value,  # the same single cache
-                        use_cache=use_cache,
-                        layer_idx=self.layer_idx,       # or pass 0
+                        past_key_value=past_key_value_hp,
+                        use_cache=use_cache
                     )
-                    q_len = attn_output.size(1)
-                    k_len = k_importance.size(-1)
-                except:
-                    print(traceback.format_exc())
-                    import pdb; pdb.set_trace()
+                    head_importances = head_importances.view(bsz, q_len, self.num_heads, self.num_hidden_layers) # [B L H N]
+                q_len = attn_output.size(1)
+                k_len = k_importance.size(-1)
+            except:
+                print(traceback.format_exc())
+                import pdb; pdb.set_trace()
 
-                self.q_importance = q_importance
-                self.k_importance = k_importance
+            self.q_importance = q_importance
+            self.k_importance = k_importance
 
+            if self.train_headpredictor:
+                if self.head_importances is None:
+                    self.head_importances = head_importances
+                else:
+                    self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
+        
+        # if self.layer_idx == 31:
+        #     if q_len == 1:
+        #         self.dtok += 1
+        #         print(f"Primary Key-Value Shape: {past_key_value.predictor_primary_key[0].shape}, Importance: {past_key_value.predictor_importance_key[0].shape}, Tok-Decoded: {self.dtok}")
+        #     else:
+        #         self.dtok = 0
 
-            if not output_attentions:
-                attn_weights = None
+        if not output_attentions:
+            attn_weights = None
         return attn_output, attn_weights
 
 def convert_kvcache_experimental(model, config, producer_frequency):
@@ -1348,7 +1430,5 @@ class LlamaButlerForCausalLM(LlamaForCausalLM):
         in place of the standard 'past_key_values'.
         """
         if "past_key_values" not in model_kwargs or model_kwargs["past_key_values"] is None:
-            cache = FlashInferDynamicCache()
-            cache.config = self.config
-            model_kwargs["past_key_values"] = cache
+            model_kwargs["past_key_values"] = PredictorDynamicCache()
         return model_kwargs
